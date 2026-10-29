@@ -34,10 +34,13 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Literal, override
 
+import jax.numpy as jnp
 import torch  # pyright: ignore[reportMissingImports]
 
 from kups.potential.mliap.torch.interface import (
+    AtomGraphInput,
     TorchMliap,
+    _prepare_torch_inputs,
     lattice_gradient_from_virial,
 )
 
@@ -94,6 +97,35 @@ class UMAModule(torch.nn.Module):
         self.task_name = str(task_name)
         self.compute_cell_gradients = compute_cell_gradients
 
+    def _prepare_inputs(self, graph: Any) -> AtomGraphInput:
+        """Select molecular metadata without changing generic model inputs."""
+        inputs = _prepare_torch_inputs(graph)
+        if self.task_name != "omol":
+            return inputs
+        n_sys = inputs["cell"].shape[0]
+        for field_name, input_name, default in (
+            ("total_charge", "charge", 0),
+            ("spin_multiplicity", "spin", 1),
+        ):
+            value = getattr(graph.systems.data, field_name, None)
+            if value is None:
+                value = jnp.full((n_sys,), default, dtype=int)
+            if not jnp.issubdtype(value.dtype, jnp.integer):
+                raise TypeError(f"{field_name} must have an integer dtype.")
+            if value.shape != (n_sys,):
+                raise ValueError(
+                    f"{field_name} must have shape ({n_sys},); got {value.shape}."
+                )
+            if jnp.issubdtype(value.dtype, jnp.unsignedinteger):
+                # The bridge supports signed integers and uint8. Keep valid
+                # values exact; map larger unsigned values to an invalid signed
+                # sentinel so forward rejects them without overflow or host reads.
+                value = jnp.minimum(value, jnp.asarray(101, dtype=value.dtype)).astype(
+                    int
+                )
+            inputs[input_name] = value
+        return inputs
+
     @override
     def forward(self, input: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:  # type: ignore
         """Run UMA on a universal ``AtomGraphInput`` and return gradients.
@@ -132,8 +164,6 @@ class UMAModule(torch.nn.Module):
         edge_index = input["edge_index"].to(dtype=torch.int64)
         cell_offsets = -input["cell_offsets"].to(dtype=inf_dtype)
         pbc = input["pbc"]
-        charge = input["charge"].to(dtype=inf_dtype)
-        spin = input["spin"].to(dtype=inf_dtype)
 
         n_atoms = pos.shape[0]
         n_sys = cell.shape[0]
@@ -162,6 +192,26 @@ class UMAModule(torch.nn.Module):
                     n_sys, 3, 3, dtype=out_dtype, device=dev
                 )
             return result
+
+        if self.task_name == "omol":
+            for name, lower, upper in (("charge", -100, 100), ("spin", 1, 100)):
+                value = input[name]
+                if (
+                    value.dtype == torch.bool
+                    or value.is_floating_point()
+                    or value.is_complex()
+                ):
+                    raise TypeError(f"{name} must have an integer dtype for omol.")
+                if value.shape != (n_sys,):
+                    raise ValueError(
+                        f"{name} must have shape ({n_sys},); got {value.shape}."
+                    )
+                # Signed bounds must not wrap in an unsigned tensor's dtype.
+                checked = value.to(dtype=torch.float64)
+                if bool(((checked < lower) | (checked > upper)).any().item()):
+                    raise ValueError(f"{name} must be in [{lower}, {upper}] for omol.")
+        charge = input["charge"].to(dtype=inf_dtype)
+        spin = input["spin"].to(dtype=inf_dtype)
 
         # kUPS's neighbor list is a fixed-size buffer; ``indices_in`` maps
         # unused slots to the OOB sentinel ``len(keys) == n_atoms``. Drop
@@ -342,5 +392,8 @@ def load_uma(
         compute_cell_gradients=compute_cell_gradients,
     )
     return TorchMliap.from_module(
-        module, cutoff=cutoff, compute_cell_gradients=compute_cell_gradients
+        module,
+        cutoff=cutoff,
+        compute_cell_gradients=compute_cell_gradients,
+        input_builder=module._prepare_inputs,
     )
